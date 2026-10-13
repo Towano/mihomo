@@ -158,6 +158,43 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 
 			proxies = append(proxies, tuic)
 
+		case "juicity":
+			// juicity share link: juicity://uuid:password@host:port?sni=...&allow_insecure=1&pinned_peer_cert_sha256=...
+			urlJuicity, err := url.Parse(line)
+			if err != nil {
+				continue
+			}
+			query := urlJuicity.Query()
+
+			juicity := make(map[string]any, 16)
+			juicity["name"] = uniqueName(names, urlJuicity.Fragment)
+			juicity["type"] = scheme
+			juicity["server"] = urlJuicity.Hostname()
+			juicity["port"] = urlJuicity.Port()
+			password, hasPassword := urlJuicity.User.Password()
+			if hasPassword {
+				juicity["uuid"] = urlJuicity.User.Username()
+				juicity["password"] = password
+			} else {
+				juicity["uuid"] = urlJuicity.User.Username()
+			}
+			if sni := query.Get("sni"); sni != "" {
+				juicity["sni"] = sni
+			}
+			if query.Get("allow_insecure") == "1" || query.Get("allowInsecure") == "1" {
+				juicity["skip-cert-verify"] = true
+			}
+			if pinned := query.Get("pinned_peer_cert_sha256"); pinned != "" {
+				juicity["pinned-peer-cert-sha256"] = pinned
+			}
+			if cc := query.Get("congestion_control"); cc != "" {
+				juicity["congestion-controller"] = cc
+			}
+			if alpn := query.Get("alpn"); alpn != "" {
+				juicity["alpn"] = strings.Split(alpn, ",")
+			}
+			proxies = append(proxies, juicity)
+
 		case "trojan":
 			urlTrojan, err := url.Parse(line)
 			if err != nil {
