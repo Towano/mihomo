@@ -80,13 +80,13 @@ func (j *Juicity) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
 	return NewPacketConn(pc, j), nil
 }
 
-func (j *Juicity) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
-	_, quicConn, err = common.DialQuic(ctx, j.addr, j.DialOptions(), j.dialer, j.tlsConfig, j.quicConfig, common.DialQuicOption{Early: j.option.ReduceRtt})
+func (j *Juicity) dial(ctx context.Context) (pc net.PacketConn, quicConn *quic.Conn, err error) {
+	pc, quicConn, err = common.DialQuic(ctx, j.addr, j.DialOptions(), j.dialer, j.tlsConfig, j.quicConfig, common.DialQuicOption{Early: j.option.ReduceRtt})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	common.SetCongestionController(quicConn, j.option.CongestionController, j.option.CWND, "")
-	return quicConn, nil
+	return pc, quicConn, nil
 }
 
 // ProxyInfo implements C.ProxyAdapter

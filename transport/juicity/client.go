@@ -2,6 +2,7 @@ package juicity
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,6 +26,11 @@ import (
 
 const DefaultMaxOpenStreams = 100
 
+// DialFunc is juicity's variant of types.DialFunc — it must return both the
+// QUIC connection and the raw UDP socket it rides on so the underlay path
+// (port-0 UDP assocs) can send non-QUIC datagrams on the same socket.
+type DialFunc func(ctx context.Context) (pc net.PacketConn, quicConn *quic.Conn, err error)
+
 // ClientOption mirrors the tunable surface of daeuniverse's juicity client.
 type ClientOption struct {
 	Uuid           [16]byte
@@ -34,15 +40,21 @@ type ClientOption struct {
 
 type clientImpl struct {
 	*ClientOption
-	dialFn types.DialFunc
+	dialFn DialFunc
 
 	quicConn  *quic.Conn
+	underConn net.PacketConn // the raw UDP socket QUIC rides on; shared with the underlay path
 	connMutex sync.Mutex
 
 	openStreams atomic.Int64
 	closed      atomic.Bool
 
 	lastVisited atomic.Value
+
+	// underlayAuth: psk records sent on the auth uni-stream, one per port-0 UDP assoc.
+	underlayAuth chan *UnderlayAuth
+	authStream   *quic.SendStream
+	authStreamMu sync.Mutex
 }
 
 func (t *clientImpl) OpenStreams() int64 { return t.openStreams.Load() }
@@ -62,21 +74,22 @@ func (t *clientImpl) getQuicConn(ctx context.Context) (*quic.Conn, error) {
 	if t.quicConn != nil {
 		return t.quicConn, nil
 	}
-	quicConn, err := t.dialFn(ctx)
+	pc, quicConn, err := t.dialFn(ctx)
 	if err != nil {
 		return nil, err
 	}
 	go func() {
 		_ = t.sendAuthentication(quicConn)
 	}()
+	t.underConn = pc
 	t.quicConn = quicConn
 	t.openStreams.Store(0)
 	return quicConn, nil
 }
 
 // sendAuthentication opens a uni-stream, writes
-// [VER=0][AuthenticateType=0][UUID][TOKEN], and keeps the stream open: the
-// juicity server uses it for underlay-auth back-pressure as well as auth.
+// [VER=0][AuthenticateType=0][UUID][TOKEN], then keeps the stream open to
+// relay UnderlayAuth records as port-0 UDP assocs are created.
 func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 	defer func() { t.deferQuicConn(quicConn, err) }()
 	stream, err := quicConn.OpenUniStream()
@@ -90,10 +103,67 @@ func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 	if err = WriteAuthenticate(stream, t.Uuid, token); err != nil {
 		return err
 	}
-	// dae's client holds the uni-stream open for the life of the connection so
-	// it can keep pushing UnderlayAuth records; we don't send them, but keep the
-	// stream open anyway so the server sees the same shape.
-	return nil
+	// stash the stream so the underlay path can send psk records on it.
+	t.authStreamMu.Lock()
+	t.authStream = stream
+	t.authStreamMu.Unlock()
+
+	// pump underlay-auth records for the life of the connection.
+	for {
+		select {
+		case <-quicConn.Context().Done():
+			return quicConn.Context().Err()
+		case auth, ok := <-t.underlayAuth:
+			if !ok {
+				return nil
+			}
+			buf := pool.Get(auth.Len())
+			n := auth.PackTo(buf)
+			if _, werr := stream.Write(buf[:n]); werr != nil {
+				pool.Put(buf)
+				return werr
+			}
+			pool.Put(buf)
+		}
+	}
+}
+
+// DialAuth registers a port-0 UDP assoc by generating iv+psk and queuing them
+// on the auth stream. Returns them so the caller can build the underlay conn.
+func (t *clientImpl) DialAuth(ctx context.Context, metadata *C.Metadata) (iv, psk []byte, err error) {
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	default:
+	}
+	if _, err = t.getQuicConn(ctx); err != nil {
+		return nil, nil, err
+	}
+	iv = pool.Get(underlaySaltLen)
+	iv[0], iv[1] = 0, 0
+	if _, err := rand.Read(iv[2:]); err != nil {
+		pool.Put(iv)
+		return nil, nil, err
+	}
+	psk = pool.Get(underlayKeyLen)
+	if _, err := rand.Read(psk); err != nil {
+		pool.Put(iv)
+		pool.Put(psk)
+		return nil, nil, err
+	}
+	auth := &UnderlayAuth{
+		IV:   iv,
+		Psk:  psk,
+		Addr: NewAddress(metadata),
+	}
+	select {
+	case t.underlayAuth <- auth:
+		return iv, psk, nil
+	case <-ctx.Done():
+		pool.Put(iv)
+		pool.Put(psk)
+		return nil, nil, ctx.Err()
+	}
 }
 
 func (t *clientImpl) deferQuicConn(quicConn *quic.Conn, err error) {
@@ -177,10 +247,15 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net
 	return stream, err
 }
 
-// ListenPacket opens one bidirectional QUIC stream per association. Outbound
-// frames: [network=3][trojan-addr] then [trojan-addr][uint16 len][payload];
-// inbound: [trojan-addr][uint16 len][payload].
+// ListenPacket routes UDP assocs two ways:
+//   - target port 0: juicity's "underlay" path — raw UDP on the same socket,
+//     chacha20-poly1305 framed, psk exchanged on the auth uni-stream.
+//   - otherwise: one bidirectional QUIC stream per association with
+//     [network=3][addr] then [addr][2B len][payload] framing.
 func (t *clientImpl) ListenPacket(ctx context.Context, metadata *C.Metadata) (net.PacketConn, error) {
+	if metadata.DstPort == 0 {
+		return t.dialUnderlay(ctx, metadata)
+	}
 	quicConn, err := t.getQuicConn(ctx)
 	if err != nil {
 		return nil, err
@@ -215,6 +290,48 @@ func (t *clientImpl) ListenPacket(ctx context.Context, metadata *C.Metadata) (ne
 				openStreams := t.openStreams.Add(-1)
 				if openStreams == 0 && t.closed.Load() {
 					t.forceClose(quicConn, types.ClientClosed)
+				}
+			})
+		},
+	}
+	return pc, nil
+}
+
+// dialUnderlay implements juicity's port-0 UDP path: negotiate a psk on the
+// auth uni-stream, then wrap every datagram in chacha20-poly1305 and send it
+// over the same UDP socket QUIC uses.
+func (t *clientImpl) dialUnderlay(ctx context.Context, metadata *C.Metadata) (net.PacketConn, error) {
+	iv, psk, err := t.DialAuth(ctx, metadata)
+	if err != nil {
+		return nil, err
+	}
+	t.connMutex.Lock()
+	underConn := t.underConn
+	t.connMutex.Unlock()
+	if underConn == nil {
+		return nil, fmt.Errorf("juicity: no underlay socket for port-0 UDP")
+	}
+	proxyAddr, err := net.ResolveUDPAddr("udp", metadata.RemoteAddress())
+	if err != nil {
+		return nil, err
+	}
+	tgtAddr, err := net.ResolveUDPAddr("udp", metadata.RemoteAddress())
+	if err != nil {
+		return nil, err
+	}
+	openStreams := t.openStreams.Add(1)
+	_ = openStreams // captured in closeDeferFn closure below
+	pc := &underlayPacketConn{
+		pc:        underConn,
+		proxyAddr: proxyAddr,
+		key:       &UnderlayKey{MasterKey: psk},
+		firstIv:   iv,
+		tgtAddr:   tgtAddr,
+		closeDeferFn: func() {
+			time.AfterFunc(C.DefaultUDPTimeout, func() {
+				openStreams := t.openStreams.Add(-1)
+				if openStreams == 0 && t.closed.Load() {
+					t.forceClose(nil, types.ClientClosed)
 				}
 			})
 		},
@@ -335,10 +452,11 @@ func (t *client) ListenPacket(ctx context.Context, metadata *C.Metadata) (net.Pa
 
 func (t *client) forceClose() { t.clientImpl.forceClose(nil, types.ClientClosed) }
 
-func NewClient(clientOption *ClientOption, dialFn types.DialFunc) Client {
+func NewClient(clientOption *ClientOption, dialFn DialFunc) Client {
 	ci := &clientImpl{
 		ClientOption: clientOption,
 		dialFn:       dialFn,
+		underlayAuth: make(chan *UnderlayAuth, 64),
 	}
 	c := &client{ci}
 	runtime.SetFinalizer(c, closeClient)
@@ -355,7 +473,7 @@ func closeClient(c *client) {
 // separate TCP/UDP pools so UDP assoc churn doesn't churn the TCP pool.
 type PoolClient struct {
 	newClientOption *ClientOption
-	dialFn          types.DialFunc
+	dialFn          DialFunc
 
 	tcpClients      list.List[Client]
 	tcpClientsMutex sync.Mutex
@@ -441,7 +559,7 @@ func (t *PoolClient) getClient(udp bool) Client {
 	return best
 }
 
-func NewPoolClient(clientOption *ClientOption, dialFn types.DialFunc) *PoolClient {
+func NewPoolClient(clientOption *ClientOption, dialFn DialFunc) *PoolClient {
 	opt := *clientOption
 	return &PoolClient{
 		newClientOption: &opt,
